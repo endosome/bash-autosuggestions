@@ -1,0 +1,19 @@
+# Debug and development files
+*-debug.sh
+debug_*.sh
+test_*.sh
+correct_approach.sh
+
+# Development notes and iteration docs
+DEBUG_*.md
+FIXES_*.md
+FIX_*.md
+FINAL_SUMMARY.md
+SESSION_SUMMARY.md
+CURRENT_STATE.md
+MANUAL_TEST_CHECKLIST.md
+RELEASE_STATUS.md
+
+# Test scripts (keep Dockerfile for users)
+test-automated.sh
+test-interactive.sh
