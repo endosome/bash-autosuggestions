@@ -63,7 +63,7 @@ bash_autosuggest_enable    # Re-enable
 ## Production Ready
 
 - 516 lines of pure Bash
-- Tested on Bash 4.0+
+- Requires Bash 4.4+; terminal regression tests run on Bash 5.3
 - Works in Docker/WSL/SSH
 - No external dependencies
 - <1ms keystroke latency
@@ -72,7 +72,7 @@ bash_autosuggest_enable    # Re-enable
 
 **Suggestions not appearing?**
 ```bash
-# Check bash version (need 4.0+)
+# Check bash version (need 4.4+)
 bash --version
 
 # Verify history exists

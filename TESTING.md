@@ -1,5 +1,37 @@
 # bash-autosuggestions - Testing Guide
 
+## Automated terminal regression tests
+
+Run these on Linux or another POSIX system with Bash 4.4+ and Python 3.10+:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-test.txt
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+These tests launch real interactive Bash sessions in isolated pseudo-terminals,
+seed temporary history files, emulate the screen with pyte, and send actual
+keypresses. They check gray ghost text, cursor position, right-arrow acceptance,
+one-Enter execution, unaccepted suggestions, editing, paste, prompt hooks, and
+job control. They use bounded I/O waits rather than sleeps or production hosts.
+
+The flicker regression records the emulated screen at the moment a history
+lookup begins and requires the prompt/input to remain visible. Other checks
+ensure typing launches no new `tac` process, history refreshes at the next prompt,
+and deletion leaves no stale characters after the immediate input restore.
+Prompt cases include `screen-256color` at 60 columns by 13 rows, nonprinting
+terminal controls, Unicode display widths, and prompts that change after a
+failed command. Diagnostic checks verify ready/disabled/unavailable states
+without exposing history contents.
+Typing checks cover every printable ASCII character, including quotes and
+backslashes, and verify disable/re-enable restores a consistent loaded state.
+Custom-binding checks cover restoring readline functions, macros, shell
+callbacks, and previously unbound keys, including changes made between activations.
+
+Set `BAS_TEST_RC` to an alternative startup script and `SSHHOME` to a transferred
+payload to exercise SSHRC or its retained tmux payload through the same tests.
+
 ## Quick Start
 
 ### 1. Build and Run Docker Test Environment
@@ -297,7 +329,7 @@ These are expected limitations (not bugs):
 2. Terminal resize mid-suggestion may leave artifacts (fixed with Ctrl+L)
 3. Vim mode is unsupported (keybindings won't work)
 
-## Automated Testing (Future)
+## Other integration tests
 
 For CI/CD integration, consider:
 ```bash
@@ -309,7 +341,7 @@ expect "ectl get pods"
 # ... etc
 ```
 
-(Automated testing not implemented in this version)
+The Python suite above provides automated coverage without Docker or expect.
 
 ---
 

@@ -1,4 +1,6 @@
 # Debug and development files
+.venv/
+__pycache__/
 *-debug.sh
 debug_*.sh
 test_*.sh

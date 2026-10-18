@@ -27,8 +27,29 @@ $ kubectl get po▌ds -n production -o wide
 
 ## Requirements
 
-- **Bash 4.0+** (check with `bash --version`)
+- **Bash 4.4+** (check with `bash --version`)
 - Terminal with ANSI color support (virtually all modern terminals)
+
+The foreground renderer uses Bash 4.4's prompt expansion to position suggestions
+without background jobs. It preserves job control and scalar/array prompt hooks.
+It requires emacs editing mode and an interactive terminal; unsupported shells
+and vi mode skip activation. Suggestions are clipped to the available terminal
+row. Input/history entries containing non-ASCII or control characters omit
+suggestions rather than guessing their display widths. Prompt nonprinting
+regions, ANSI colors, terminal titles and Unicode text are supported. Unicode
+prompt widths use GNU `wc --max-line-length` in the `C.UTF-8` locale; ASCII
+prompts use shell builtins only.
+
+Prompts and input that wrap across terminal rows are supported: suggestion
+positioning uses the wrapped row and column, including inside narrow tmux panes.
+Very short viewports where the prompt/input occupy more rows than the screen
+remain a rendering limitation.
+
+History and prompt widths are cached at each prompt. Keystrokes search the
+in-memory snapshot without spawning `history | tac` pipelines. Bash's `bind -x`
+still clears its display before each callback; the plugin immediately restores
+the input before doing a lookup, so history searches do not leave the line blank
+over SSH. History added by a command becomes available at the following prompt.
 
 ## Installation
 
@@ -109,7 +130,7 @@ Falls back to `history` strategy if no contextual match is found.
 ## Disabling at Runtime
 
 ```bash
-# Disable autosuggestions in the current shell (removes all bindings)
+# Disable autosuggestions and restore the previous keybindings
 bash_autosuggest_disable
 
 # Re-enable autosuggestions
@@ -117,7 +138,15 @@ bash_autosuggest_enable
 
 # Toggle on/off (lightweight - keeps bindings)
 bash_autosuggest_toggle
+
+# Diagnose the loaded copy, prompt width, terminal size and history count.
+# Reports why rendering is unavailable without printing commands from history.
+bash_autosuggest_status
 ```
+
+Disabling restores the readline functions, macros, and shell callbacks that the
+plugin replaced. Unrelated bindings added while it was active are preserved.
+Re-enabling takes a fresh snapshot of the current bindings.
 
 ## Uninstalling
 
@@ -158,7 +187,10 @@ rm -rf ~/.local/share/bash-autosuggestions
 ## Troubleshooting
 
 ### Suggestions don't appear
-- Ensure Bash 4.0+: `echo $BASH_VERSION`
+- Run `bash_autosuggest_status`. `rendering=prompt-width-unavailable` means the
+  prompt could not be measured; `rendering=no-history` means the history cache
+  is empty. `source=` identifies which transferred/installed copy is loaded.
+- Ensure Bash 4.4+: `echo $BASH_VERSION`
 - Check your history is non-empty: `history | wc -l`
 - Ensure `HISTFILE` is set and readable
 - Make sure the script is sourced (not executed): `source bash-autosuggestions.sh`
@@ -178,13 +210,16 @@ rm -rf ~/.local/share/bash-autosuggestions
 
 ## How It Works (Technical)
 
-The script uses Bash's `bind` command to create macros for every printable character. Each macro inserts the character normally, then triggers an internal function (`_bas_update`) via `Ctrl+_`. This function:
+The script uses Bash's `bind -x` to handle printable ASCII characters. Each
+handler updates `READLINE_LINE` and searches history for matching commands.
+The foreground renderer expands the prompt with `${PS1@P}`, removes its color
+and title sequences for width calculation, and draws the suffix at the final
+input column before readline redraws the prompt and typed text. It launches no
+background terminal writers and leaves job control enabled.
 
-1. Reads the current `READLINE_LINE` (what the user has typed)
-2. Searches history in reverse for the most recent match
-3. Renders the untyped suffix as "ghost text" using ANSI escape codes (save cursor → print dimmed text → restore cursor)
-
-Accept keys (`→`, `End`, `Alt+→`) modify `READLINE_LINE` and `READLINE_POINT` directly to insert the suggestion.
+Accept keys (`→`, `End`, `Alt+→`) modify `READLINE_LINE` and `READLINE_POINT`
+only when the cursor is still at the end of the matching typed input. Ghost
+text is never inserted into the command buffer until explicitly accepted.
 
 ## License
 

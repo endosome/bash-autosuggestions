@@ -17,12 +17,16 @@
 #   BASH_AUTOSUGGEST_MIN_LENGTH - min chars before suggesting (default: 1)
 #   BASH_AUTOSUGGEST_HISTORY_IGNORE - glob pattern to skip
 #
-# REQUIREMENTS: Bash 4.0+
+# REQUIREMENTS: Bash 4.4+ (prompt expansion for synchronous rendering)
 # ============================================================================
 
 [[ $- != *i* ]] && return
-[[ -n "$_BASH_AUTOSUGGEST_LOADED" ]] && return
+(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )) || return 0
+[[ -t 0 && -t 1 && ${TERM:-dumb} != dumb ]] || return 0
+[[ -o emacs ]] || return 0
+[[ -n "${_BASH_AUTOSUGGEST_LOADED:-}" ]] && return 0
 _BASH_AUTOSUGGEST_LOADED=1
+_bas_source_file="${BASH_SOURCE[0]}"
 shopt -s extglob
 
 : "${BASH_AUTOSUGGEST_HIGHLIGHT:=38;5;244}"
@@ -34,6 +38,7 @@ shopt -s extglob
 # --- Internal state ---
 _bas_typed=""             # What the user actually typed
 _bas_ghost=""             # The ghost suffix currently displayed
+_bas_history=()           # History snapshot, rebuilt at each prompt
 _bas_candidates=()        # All matching history entries
 _bas_cand_idx=-1          # Current index in candidates (-1 = none)
 _bas_showing=0            # Whether ghost text is on screen
@@ -57,17 +62,14 @@ _bas_collect_candidates() {
     local contextual_matches=()
     local regular_matches=()
     
-    # Read history in reverse (most recent first)
-    while IFS='' read -r line; do
-        # Strip leading spaces and history number
-        line="${line#"${line%%[! ]*}"}"
-        line="${line##+([0-9])}"
-        line="${line#"${line%%[! ]*}"}"
-
+    # The prompt hook already parsed history; typing never forks or calls tac.
+    for line in "${_bas_history[@]}"; do
         # Check if this line matches our input prefix
         if [[ "$line" == "$input"* && "$line" != "$input" && -z "${seen[$line]+x}" ]]; then
             if [[ -n "$BASH_AUTOSUGGEST_HISTORY_IGNORE" ]]; then
-                eval "[[ \"\$line\" == $BASH_AUTOSUGGEST_HISTORY_IGNORE ]]" 2>/dev/null && continue
+                # The configured value is a glob pattern, never shell code.
+                # shellcheck disable=SC2053
+                [[ "$line" == $BASH_AUTOSUGGEST_HISTORY_IGNORE ]] && continue
             fi
             seen[$line]=1
             
@@ -90,7 +92,7 @@ _bas_collect_candidates() {
         if [[ -n "$line" ]]; then
             prev_line="$line"
         fi
-    done < <(HISTTIMEFORMAT='' builtin history | tac)
+    done
     
     # For match_prev_cmd: combine contextual matches first, then regular
     if [[ "$BASH_AUTOSUGGEST_STRATEGY" == "match_prev_cmd" ]]; then
@@ -103,48 +105,123 @@ _bas_collect_candidates() {
 }
 
 # ============================================================================
-# Display: colored ghost text via direct terminal output
-#
-# Strategy: bind -x functions execute BEFORE readline redraws. After our
-# function returns, readline will redraw the prompt + READLINE_LINE and
-# position the cursor at READLINE_POINT. We print our ghost text
-# immediately, but it appears AFTER readline's redraw completes.
-#
-# The ghost text is printed with ANSI color codes directly to /dev/tty:
-#   \e7        - Save cursor position (where readline left it)
-#   \e[...m    - Set color (using BASH_AUTOSUGGEST_HIGHLIGHT)
-#   <text>     - The ghost suggestion
-#   \e[2m      - Dim attribute for counter
-#   [N/M]      - Match counter if multiple suggestions
-#   \e[0m      - Reset all attributes
-#   \e8        - Restore cursor position
-#
-# On the NEXT keypress, we erase the ghost before doing anything else.
+# Display: foreground rendering at the end of the typed input.
+# Bash clears the last prompt line before a bind -x handler, then redraws it
+# afterwards. Draw the suffix at its final column and restore column zero;
+# readline's redraw fills in the prompt/input without overwriting the suffix.
+# No background writer can race with typing, command output, or Ctrl-C.
 # ============================================================================
-_bas_show_ghost() {
-    local suffix="$1"
-    [[ -z "$suffix" ]] && return
+_bas_cache_prompt() {
+    _bas_prompt_text=${1-${PS1@P}}
+    _bas_prompt_text="${_bas_prompt_text##*$'\n'}"
+    local prompt="$_bas_prompt_text" ansi
+    # \[...\] in PS1 becomes readline's SOH/STX nonprinting region. Trust
+    # those regions as readline does: charset selectors, tput resets and other
+    # terminal controls inside them all contribute zero visible columns.
+    ansi=$'\001[^\002]*\002'
+    while [[ $prompt =~ $ansi ]]; do
+        prompt="${prompt/"${BASH_REMATCH[0]}"/}"
+    done
+    _bas_prompt_text="${_bas_prompt_text//$'\001'/}"
+    _bas_prompt_text="${_bas_prompt_text//$'\002'/}"
+    ansi=$'\e''].*'$'\a'
+    while [[ $prompt =~ $ansi ]]; do
+        prompt="${prompt/"${BASH_REMATCH[0]}"/}"
+    done
+    ansi=$'\e].*\e\\\\'
+    while [[ $prompt =~ $ansi ]]; do
+        prompt="${prompt/"${BASH_REMATCH[0]}"/}"
+    done
+    ansi=$'\e''\[[0-?]*[ -/]*[@-~]'
+    while [[ $prompt =~ $ansi ]]; do
+        prompt="${prompt/"${BASH_REMATCH[0]}"/}"
+    done
+    local LC_ALL=C
+    _bas_prompt_width=-1
+    if [[ $prompt != *[!\ -~]* ]]; then
+        _bas_prompt_width=${#prompt}
+    else
+        # Non-ASCII prompt text is common (directories, branch names, themes).
+        # Count display columns, including wide glyphs, once per prompt. GNU
+        # coreutils is already used for tac; older/non-GNU wc can fail safely.
+        local display_width
+        if display_width=$(printf '%s' "$prompt" | LC_ALL=C.UTF-8 command wc --max-line-length 2>/dev/null); then
+            display_width="${display_width//[[:space:]]/}"
+            if [[ $display_width =~ ^[0-9]+$ ]]; then
+                _bas_prompt_width=$display_width
+            fi
+        fi
+    fi
+}
 
+_bas_refresh_history() {
+    _bas_history=()
+    local line
+    while IFS='' read -r line; do
+        line="${line#"${line%%[! ]*}"}"
+        line="${line##+([0-9])}"
+        line="${line#"${line%%[! ]*}"}"
+        _bas_history+=("$line")
+    done < <(HISTTIMEFORMAT='' builtin history | tac)
+}
+
+_bas_dispatch() {
+    # Bash clears the input before entering bind -x. Restore it immediately,
+    # before looking at history, so a slow lookup never leaves a blank prompt.
+    local LC_ALL=C restored=0 old_length=${#READLINE_LINE}
+    if ((_bas_prompt_width >= 0 && _bas_prompt_width + ${#READLINE_LINE} < ${COLUMNS:-80})) &&
+        [[ $READLINE_LINE != *[!\ -~]* ]]; then
+        printf '%s%s' "$_bas_prompt_text" "$READLINE_LINE" >/dev/tty
+        restored=1
+    fi
+    "$@"
+    local handler_status=$?
+    # The temporary restore must not leave deleted characters behind when
+    # readline redraws a shorter buffer over what it believes is a blank line.
+    if ((restored && ${#READLINE_LINE} < old_length)); then
+        printf '\r\e[%dC\e[K' "$((_bas_prompt_width + ${#READLINE_LINE}))" >/dev/tty
+        if ((_bas_showing)); then
+            _bas_show_ghost "$_bas_ghost"
+        fi
+    fi
+    # Readline believes the cursor is still at column zero after its clear.
+    printf '\r' >/dev/tty
+    return "$handler_status"
+}
+
+_bas_show_ghost() {
+    local suffix="$1" LC_ALL=C
+    [[ -n "$suffix" && $READLINE_LINE != *[!\ -~]* && $suffix != *[!\ -~]* ]] || return 0
+    ((_bas_prompt_width >= 0)) || return 0
+    local width=${COLUMNS:-80}
+    ((width > 0)) || return 0
+    local offset=$((_bas_prompt_width + ${#READLINE_LINE}))
+    local row=$((offset / width)) column=$((offset % width))
+    local available=$((width - column - 1))
+    ((available > 0)) || return 0
+    local counter="" count=${#_bas_candidates[@]}
+    if ((count > 1)); then
+        counter=" [$((_bas_cand_idx + 1))/$count]"
+    fi
+    if ((${#suffix} + ${#counter} > available)); then
+        counter=""
+    fi
     _bas_ghost="$suffix"
     _bas_showing=1
-
-    local count=${#_bas_candidates[@]}
-    local idx_display=""
-    if (( count > 1 )); then
-        idx_display=" [$((_bas_cand_idx+1))/${count}]"
-    fi
-
-    # Print the ghost text and counter, then move cursor back to end of typed text
-    # \e[<N>D moves cursor left N positions
-    local total_ghost_len=$((${#suffix} + ${#idx_display}))
-    printf '\e[%sm%s\e[0m\e[2m%s\e[0m\e[%dD' \
-        "$BASH_AUTOSUGGEST_HIGHLIGHT" "$suffix" "$idx_display" "$total_ghost_len" > /dev/tty
+    # Readline clears wrapped input back to the first physical prompt row.
+    # Position relative to that origin rather than suppressing wrapped lines.
+    {
+        printf '\e7\r'
+        if ((row > 0)); then printf '\e[%dB' "$row"; fi
+        if ((column > 0)); then printf '\e[%dC' "$column"; fi
+        printf '\e[%sm%s\e[0m\e[2m%s\e[0m\e8' \
+            "$BASH_AUTOSUGGEST_HIGHLIGHT" "${suffix:0:available}" "$counter"
+    } >/dev/tty
 }
 
 _bas_clear_ghost() {
-    # Always clear from cursor to end of line, regardless of state
-    # This ensures ghost is removed even if _bas_showing flag is out of sync
-    printf '\e[K' > /dev/tty
+    # Readline already erased the previous suffix before calling bind -x.
+    # A second erase would blank the input restored by _bas_dispatch.
     _bas_ghost=""
     _bas_showing=0
     # Also clear any pending ghost that hasn't been displayed yet
@@ -191,7 +268,7 @@ _bas_show_current_candidate() {
     if (( _bas_cand_idx >= 0 && _bas_cand_idx < ${#_bas_candidates[@]} )); then
         local suffix="${_bas_candidates[$_bas_cand_idx]:${#_bas_typed}}"
         
-        # Store for async display
+        # Prepare the foreground display.
         _bas_pending_ghost="$suffix"
         _bas_pending_counter=""
         if (( ${#_bas_candidates[@]} > 1 )); then
@@ -209,25 +286,8 @@ _bas_show_current_candidate() {
 # We must manually insert the character into READLINE_LINE.
 # ============================================================================
 _bas_show_ghost_after_redisplay() {
-    # Display ghost text after a minimal delay using background job
     if [[ -n "$_bas_pending_ghost" ]]; then
-        _bas_ghost="$_bas_pending_ghost"
-        _bas_showing=1
-        
-        # Launch background job and immediately disown to remove from job table
-        {
-            # Minimal delay to let readline finish cursor positioning
-            read -t 0.001 < /dev/null 2>/dev/null || true
-            
-            # Print ghost and reposition cursor
-            printf '\e[%sm%s\e[0m\e[2m%s\e[0m\e[%dD' \
-                "$BASH_AUTOSUGGEST_HIGHLIGHT" "$_bas_pending_ghost" "$_bas_pending_counter" \
-                "$((${#_bas_pending_ghost} + ${#_bas_pending_counter}))" > /dev/tty
-        } &>/dev/null &
-        
-        # Remove job from job table immediately
-        disown -a 2>/dev/null
-        
+        _bas_show_ghost "$_bas_pending_ghost"
         _bas_pending_ghost=""
         _bas_pending_counter=""
     fi
@@ -236,6 +296,8 @@ _bas_show_ghost_after_redisplay() {
 _bas_self_insert_and_update() {
     local char="$1"
     _bas_clear_ghost
+    _bas_candidates=()
+    _bas_cand_idx=-1
     
     # Insert character at cursor position
     local line="$READLINE_LINE"
@@ -258,7 +320,7 @@ _bas_self_insert_and_update() {
                 _bas_cand_idx=0
                 local suffix="${_bas_candidates[0]:${#typed}}"
                 
-                # Store the ghost to show it AFTER readline redraws
+                # Draw at the final input column before readline redraws.
                 _bas_pending_ghost="$suffix"
                 _bas_pending_counter=""
                 if (( ${#_bas_candidates[@]} > 1 )); then
@@ -269,10 +331,7 @@ _bas_self_insert_and_update() {
                 READLINE_LINE="$new_line"
                 READLINE_POINT=$new_point
                 
-                # Schedule ghost display to happen after this handler returns
-                # Use PROMPT_COMMAND to display on next prompt cycle
-                # Store for display after readline finishes
-                trap '_bas_show_ghost_after_redisplay; trap - RETURN' RETURN
+                _bas_show_ghost_after_redisplay
                 return
             fi
         fi
@@ -315,13 +374,13 @@ _bas_backspace_handler() {
                     _bas_cand_idx=0
                     local suffix="${_bas_candidates[0]:${#typed}}"
                     
-                    # Store for async display
+                    # Prepare the foreground display.
                     _bas_pending_ghost="$suffix"
                     _bas_pending_counter=""
                     if (( ${#_bas_candidates[@]} > 1 )); then
                         _bas_pending_counter=" [1/${#_bas_candidates[@]}]"
                     fi
-                    trap '_bas_show_ghost_after_redisplay; trap - RETURN' RETURN
+                    _bas_show_ghost_after_redisplay
                 else
                     _bas_candidates=()
                     _bas_cand_idx=-1
@@ -332,7 +391,6 @@ _bas_backspace_handler() {
                 # Clear any pending ghost and cancel any scheduled display
                 _bas_pending_ghost=""
                 _bas_pending_counter=""
-                trap - RETURN  # Cancel any pending RETURN trap
             fi
         else
             _bas_candidates=()
@@ -341,7 +399,6 @@ _bas_backspace_handler() {
             # Clear any pending ghost and cancel any scheduled display
             _bas_pending_ghost=""
             _bas_pending_counter=""
-            trap - RETURN  # Cancel any pending RETURN trap
         fi
     else
         # At start of line - clear everything
@@ -349,11 +406,13 @@ _bas_backspace_handler() {
         _bas_cand_idx=-1
         _bas_pending_ghost=""
         _bas_pending_counter=""
-        trap - RETURN  # Cancel any pending RETURN trap
     fi
 }
 
 _bas_delete_handler() {
+    if (( READLINE_POINT < ${#READLINE_LINE} )); then
+        READLINE_LINE="${READLINE_LINE:0:READLINE_POINT}${READLINE_LINE:READLINE_POINT+1}"
+    fi
     _bas_clear_ghost
     _bas_candidates=()
     _bas_cand_idx=-1
@@ -388,13 +447,13 @@ _bas_kill_word_handler() {
                 _bas_cand_idx=0
                 local suffix="${_bas_candidates[0]:${#typed}}"
                 
-                # Store for async display
+                # Prepare the foreground display.
                 _bas_pending_ghost="$suffix"
                 _bas_pending_counter=""
                 if (( ${#_bas_candidates[@]} > 1 )); then
                     _bas_pending_counter=" [1/${#_bas_candidates[@]}]"
                 fi
-                trap '_bas_show_ghost_after_redisplay; trap - RETURN' RETURN
+                _bas_show_ghost_after_redisplay
             else
                 _bas_candidates=()
                 _bas_cand_idx=-1
@@ -437,8 +496,8 @@ _bas_cycle_next() {
             _bas_pending_counter=" [$((_bas_cand_idx+1))/${#_bas_candidates[@]}]"
         fi
         
-        # Display after handler returns
-        trap '_bas_show_ghost_after_redisplay; trap - RETURN' RETURN
+        # Render before readline redraws the input.
+        _bas_show_ghost_after_redisplay
     elif (( ${#_bas_candidates[@]} == 1 )); then
         # Only one suggestion - do nothing (or could fall back to history)
         :
@@ -469,8 +528,8 @@ _bas_cycle_prev() {
             _bas_pending_counter=" [$((_bas_cand_idx+1))/${#_bas_candidates[@]}]"
         fi
         
-        # Display after handler returns
-        trap '_bas_show_ghost_after_redisplay; trap - RETURN' RETURN
+        # Render before readline redraws the input.
+        _bas_show_ghost_after_redisplay
     elif (( ${#_bas_candidates[@]} == 1 )); then
         # Only one suggestion - do nothing
         :
@@ -487,7 +546,8 @@ _bas_cycle_prev() {
 # Accept / dismiss
 # ============================================================================
 _bas_accept_full() {
-    if (( _bas_showing )) && (( ${#_bas_candidates[@]} > 0 )); then
+    if (( _bas_showing )) && (( READLINE_POINT == ${#READLINE_LINE} )) &&
+        [[ $READLINE_LINE == "$_bas_typed" ]] && (( ${#_bas_candidates[@]} > 0 )); then
         _bas_clear_ghost
         READLINE_LINE="${_bas_candidates[$_bas_cand_idx]}"
         READLINE_POINT=${#READLINE_LINE}
@@ -502,7 +562,8 @@ _bas_accept_full() {
 }
 
 _bas_accept_end() {
-    if (( _bas_showing )) && (( ${#_bas_candidates[@]} > 0 )); then
+    if (( _bas_showing )) && (( READLINE_POINT == ${#READLINE_LINE} )) &&
+        [[ $READLINE_LINE == "$_bas_typed" ]] && (( ${#_bas_candidates[@]} > 0 )); then
         _bas_clear_ghost
         READLINE_LINE="${_bas_candidates[$_bas_cand_idx]}"
         READLINE_POINT=${#READLINE_LINE}
@@ -516,7 +577,8 @@ _bas_accept_end() {
 }
 
 _bas_accept_word() {
-    if (( _bas_showing )) && (( ${#_bas_candidates[@]} > 0 )); then
+    if (( _bas_showing )) && (( READLINE_POINT == ${#READLINE_LINE} )) &&
+        [[ $READLINE_LINE == "$_bas_typed" ]] && (( ${#_bas_candidates[@]} > 0 )); then
         _bas_clear_ghost
         local full="${_bas_candidates[$_bas_cand_idx]}"
         local remaining="${full:${#_bas_typed}}"
@@ -590,64 +652,97 @@ _bas_enter_handler() {
 }
 
 _bas_rebind_enter() {
-    bind -x '"\C-m": _bas_enter_handler'
-    bind -x '"\C-j": _bas_enter_handler'
+    bind -x '"\C-m": _bas_dispatch _bas_enter_handler'
+    bind -x '"\C-j": _bas_dispatch _bas_enter_handler'
 }
 
 # ============================================================================
 # Setup
 # ============================================================================
 _bas_setup() {
-    # Disable job control monitoring to prevent "[1] 359" messages from background jobs
-    set +m
+    # Keep readline's own reusable syntax; restoring a shell binding must not
+    # execute it. Snapshot again on every activation to respect later changes.
+    _bas_saved_bindings=()
+    _bas_saved_shell_bindings=()
+    _bas_bound_keys=()
+    local binding key
+    while IFS= read -r binding; do
+        [[ $binding == \"* ]] && _bas_saved_bindings+=("$binding")
+    done < <(bind -p; bind -s)
+    mapfile -t _bas_saved_shell_bindings < <(bind -X)
+
+    # Readline otherwise replaces our backspace/kill bindings with the tty's
+    # erase/kill actions when it prepares the first interactive input line.
+    local option value
+    while read -r _ option value; do
+        if [[ $option == bind-tty-special-chars ]]; then
+            _bas_saved_bind_tty_special_chars="$value"
+            break
+        fi
+    done < <(bind -v)
+    bind 'set bind-tty-special-chars off'
     
     # Accept / dismiss
-    bind -x '"\e[C":    _bas_accept_full'
-    bind -x '"\eOC":    _bas_accept_full'
-    bind -x '"\e[F":    _bas_accept_end'
-    bind -x '"\eOF":    _bas_accept_end'
-    bind -x '"\e[4~":   _bas_accept_end'
-    bind -x '"\e[1;3C": _bas_accept_word'
-    bind -x '"\e\e[C":  _bas_accept_word'
-    bind -x '"\ef":     _bas_accept_word'
-    bind -x '"\C-]":    _bas_dismiss'
+    bind -x '"\e[C":    _bas_dispatch _bas_accept_full'
+    bind -x '"\eOC":    _bas_dispatch _bas_accept_full'
+    bind -x '"\e[F":    _bas_dispatch _bas_accept_end'
+    bind -x '"\eOF":    _bas_dispatch _bas_accept_end'
+    bind -x '"\e[4~":   _bas_dispatch _bas_accept_end'
+    bind -x '"\e[1;3C": _bas_dispatch _bas_accept_word'
+    bind -x '"\e\e[C":  _bas_dispatch _bas_accept_word'
+    bind -x '"\ef":     _bas_dispatch _bas_accept_word'
+    bind -x '"\C-]":    _bas_dispatch _bas_dismiss'
 
     # Suggestion cycling
-    bind -x '"\e[A": _bas_cycle_next'       # Up arrow
-    bind -x '"\eOA": _bas_cycle_next'       # Up arrow (alt seq)
-    bind -x '"\e[B": _bas_cycle_prev'       # Down arrow
-    bind -x '"\eOB": _bas_cycle_prev'       # Down arrow (alt seq)
+    bind -x '"\e[A": _bas_dispatch _bas_cycle_next'       # Up arrow
+    bind -x '"\eOA": _bas_dispatch _bas_cycle_next'       # Up arrow (alt seq)
+    bind -x '"\e[B": _bas_dispatch _bas_cycle_prev'       # Down arrow
+    bind -x '"\eOB": _bas_dispatch _bas_cycle_prev'       # Down arrow (alt seq)
 
     # Editing keys
-    bind -x '"\C-?": _bas_backspace_handler'
-    bind -x '"\C-h": _bas_backspace_handler'
-    bind -x '"\e[3~": _bas_delete_handler'
-    bind -x '"\C-w": _bas_kill_word_handler'
-    bind -x '"\C-u": _bas_kill_line_handler'
+    bind -x '"\C-?": _bas_dispatch _bas_backspace_handler'
+    bind -x '"\C-h": _bas_dispatch _bas_backspace_handler'
+    bind -x '"\e[3~": _bas_dispatch _bas_delete_handler'
+    bind -x '"\C-w": _bas_dispatch _bas_kill_word_handler'
+    bind -x '"\C-u": _bas_dispatch _bas_kill_line_handler'
 
     # Printable characters (ASCII 32-126)
-    local code char funcname
+    local code char funcname octal
     for code in $(seq 32 126); do
-        char=$(printf "\\$(printf '%03o' "$code")")
+        printf -v octal '%03o' "$code"
+        printf -v char '%b' "\\$octal"
         funcname="_bas_k${code}"
         eval "${funcname}() { _bas_self_insert_and_update $(printf '%q' "$char"); }"
         case "$code" in
-            34) bind -x '"\\"": _bas_k34' ;;
-            39) bind -x "\"'\": _bas_k39" ;;
-            92) bind -x '"\\\\": _bas_k92' ;;
-            *)  bind -x "\"${char}\": ${funcname}" ;;
+            34) bind -x '"\"": _bas_dispatch _bas_k34' ;;
+            39) bind -x "\"'\": _bas_dispatch _bas_k39" ;;
+            92) bind -x '"\\": _bas_dispatch _bas_k92' ;;
+            *)  bind -x "\"${char}\": _bas_dispatch ${funcname}" ;;
         esac
     done
+
+    # bind -X normalizes escape spellings to match bind -p/-s. Only these
+    # keys belong to us; unrelated bindings added while active stay intact.
+    while IFS= read -r binding; do
+        [[ $binding == *'"_bas_dispatch '* ]] || continue
+        key=${binding#\"}
+        _bas_bound_keys+=("${key%%\" *}")
+    done < <(bind -X)
+    _bas_bindings_active=1
 
     # Enter - DON'T bind Enter to avoid double-press issue
     # Ghost will be cleared by PROMPT_COMMAND after command executes
     # _bas_rebind_enter
 
-    # History
-    [[ -n "$HISTFILE" ]] && history -r "$HISTFILE" 2>/dev/null
+    # Bash reads HISTFILE after startup files; reading it here duplicates it.
 
     # PROMPT_COMMAND
     _bas_prompt_hook() {
+        # Expand before any command changes $?: status-dependent prompt text
+        # must have the same width here as in readline's subsequent expansion.
+        local command_status=$? expanded_prompt=${PS1@P}
+        _bas_cache_prompt "$expanded_prompt"
+        _bas_refresh_history
         _bas_showing=0
         _bas_ghost=""
         _bas_typed=""
@@ -655,49 +750,88 @@ _bas_setup() {
         _bas_cand_idx=-1
         # _bas_rebind_enter  # Not binding Enter anymore
         # Rebind arrows in case they were temporarily rebound for history nav
-        bind -x '"\e[A": _bas_cycle_next'
-        bind -x '"\eOA": _bas_cycle_next'
-        bind -x '"\e[B": _bas_cycle_prev'
-        bind -x '"\eOB": _bas_cycle_prev'
-        history -a 2>/dev/null
+        bind -x '"\e[A": _bas_dispatch _bas_cycle_next'
+        bind -x '"\eOA": _bas_dispatch _bas_cycle_next'
+        bind -x '"\e[B": _bas_dispatch _bas_cycle_prev'
+        bind -x '"\eOB": _bas_dispatch _bas_cycle_prev'
+        return "$command_status"
     }
 
-    if [[ -z "$PROMPT_COMMAND" ]]; then
+    if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+        local hook
+        for hook in "${PROMPT_COMMAND[@]}"; do
+            [[ $hook == _bas_prompt_hook ]] && return 0
+        done
+        PROMPT_COMMAND+=(_bas_prompt_hook)
+    elif [[ -z "${PROMPT_COMMAND:-}" ]]; then
         PROMPT_COMMAND="_bas_prompt_hook"
     elif [[ "$PROMPT_COMMAND" != *"_bas_prompt_hook"* ]]; then
-        PROMPT_COMMAND="_bas_prompt_hook;$PROMPT_COMMAND"
+        PROMPT_COMMAND="$PROMPT_COMMAND;_bas_prompt_hook"
     fi
 }
 
 # ============================================================================
-# Uninstall
+# Runtime diagnostics and controls
 # ============================================================================
+bash_autosuggest_status() {
+    local rendering=ready
+    if (( ! _bas_enabled )); then
+        rendering=disabled
+    elif [[ ! -o emacs ]]; then
+        rendering='unsupported-editing-mode'
+    elif (( ${_bas_prompt_width:--1} < 0 )); then
+        rendering='prompt-width-unavailable'
+    elif (( ${#_bas_history[@]} == 0 )); then
+        rendering='no-history'
+    fi
+    printf 'enabled=%s bash=%s term=%s size=%sx%s prompt_width=%s history=%s\n' \
+        "$_bas_enabled" "$BASH_VERSION" "${TERM:-unset}" "${COLUMNS:-unset}" \
+        "${LINES:-unset}" "${_bas_prompt_width:-unset}" "${#_bas_history[@]}"
+    printf 'rendering=%s source=%s\n' "$rendering" "$_bas_source_file"
+}
+
 bash_autosuggest_disable() {
     _bas_clear_ghost
     _bas_enabled=0
-    PROMPT_COMMAND="${PROMPT_COMMAND//_bas_prompt_hook;/}"
-    PROMPT_COMMAND="${PROMPT_COMMAND//_bas_prompt_hook/}"
+    bind "set bind-tty-special-chars ${_bas_saved_bind_tty_special_chars:-on}"
+    if [[ $(declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a "* ]]; then
+        local hook hooks=()
+        for hook in "${PROMPT_COMMAND[@]}"; do
+            [[ $hook == _bas_prompt_hook ]] || hooks+=("$hook")
+        done
+        PROMPT_COMMAND=("${hooks[@]}")
+    else
+        # PROMPT_COMMAND can be either a scalar or an array; this is the scalar branch.
+        # shellcheck disable=SC2178
+        PROMPT_COMMAND="${PROMPT_COMMAND//;_bas_prompt_hook/}"
+        # shellcheck disable=SC2178
+        PROMPT_COMMAND="${PROMPT_COMMAND//_bas_prompt_hook;/}"
+        # shellcheck disable=SC2178
+        PROMPT_COMMAND="${PROMPT_COMMAND//_bas_prompt_hook/}"
+    fi
 
-    local code char
+    local code binding key
+    local -A owned_keys=()
+    if (( ${_bas_bindings_active:-0} )); then
+        for key in "${_bas_bound_keys[@]}"; do
+            owned_keys["$key"]=1
+            bind -r "$key"
+        done
+        for binding in "${_bas_saved_bindings[@]}"; do
+            key=${binding#\"}
+            key=${key%%\": *}
+            [[ -n ${owned_keys[$key]+x} ]] && bind "$binding"
+        done
+        for binding in "${_bas_saved_shell_bindings[@]}"; do
+            key=${binding#\"}
+            key=${key%%\" *}
+            [[ -n ${owned_keys[$key]+x} ]] && bind -x "$binding"
+        done
+        _bas_bindings_active=0
+    fi
     for code in $(seq 32 126); do
-        char=$(printf "\\$(printf '%03o' "$code")")
-        case "$code" in
-            34) bind '"\\\"": self-insert' ;;
-            39) bind "\"'\": self-insert" ;;
-            92) bind '"\\\\": self-insert' ;;
-            *)  bind "\"${char}\": self-insert" ;;
-        esac
         unset -f "_bas_k${code}" 2>/dev/null
     done
-
-    bind '"\C-?": backward-delete-char'
-    bind '"\C-h": backward-delete-char'
-    bind '"\C-w": unix-word-rubout'
-    bind '"\C-u": unix-line-discard'
-    bind '"\C-m": accept-line'
-    bind '"\C-j": accept-line'
-    bind '"\e[A": previous-history'
-    bind '"\e[B": next-history'
 
     _BASH_AUTOSUGGEST_LOADED=""
     echo "bash-autosuggestions disabled."
@@ -709,7 +843,10 @@ bash_autosuggest_enable() {
         return
     fi
     _bas_enabled=1
-    _bas_setup
+    if (( ! ${_bas_bindings_active:-0} )); then
+        _bas_setup
+    fi
+    _BASH_AUTOSUGGEST_LOADED=1
     echo "bash-autosuggestions enabled."
 }
 
@@ -719,8 +856,7 @@ bash_autosuggest_toggle() {
         _bas_clear_ghost
         echo "bash-autosuggestions disabled (temporary)."
     else
-        _bas_enabled=1
-        echo "bash-autosuggestions enabled."
+        bash_autosuggest_enable
     fi
 }
 

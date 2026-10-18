@@ -94,7 +94,7 @@ export BASH_AUTOSUGGEST_HIGHLIGHT="2"         # Dim (uses terminal theme)
 
 ## Requirements
 
-- Bash 4.0 or later
+- Bash 4.4 or later
 - Linux/macOS (terminal with ANSI support)
 - History enabled (`HISTFILE` set)
 
