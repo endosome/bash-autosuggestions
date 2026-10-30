@@ -151,8 +151,8 @@ You'll be dropped into a bash shell with:
 **Steps**:
 1. Type: `xyz123notinhistory`
 2. Press: `↑` (up arrow)
-3. **Expected**: (May need to press Up twice - known limitation)
-4. **Pass if**: Can eventually navigate bash history
+3. **Expected**: The previous command appears on the first press
+4. **Pass if**: Up and Down navigate history on every press
 
 ### Test 11: Toggle Commands
 **Objective**: Verify runtime disable/enable

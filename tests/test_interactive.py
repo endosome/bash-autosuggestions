@@ -198,6 +198,32 @@ class InteractiveTests(unittest.TestCase):
             "808080",
         )
 
+    def test_history_arrows_act_on_first_press(self) -> None:
+        latest = "echo wrap-" + "x" * 70 + "Zsuffix"
+        older = "echo long-" + "x" * 150
+        for up, down in ((b"\x1b[A", b"\x1b[B"), (b"\x1bOA", b"\x1bOB")):
+            self.send(up)
+            self.buffer_is(latest)
+            self.send(up)
+            self.buffer_is(older)
+            self.send(down)
+            self.buffer_is(latest)
+            self.send(down)
+            self.buffer_is("")
+        self.send(b"echo second-prompt\r")
+        self.until(lambda: b"bas-status:0" in self.output)
+        self.send(b"\x1b[A")
+        self.buffer_is("echo second-prompt")
+
+    def test_arrows_still_cycle_suggestions(self) -> None:
+        self.suggestion(b"echo a", "echo another-match [1/2]")
+        self.send(b"\x1b[A")
+        self.until(lambda: "echo autosuggest-ready [2/2]" in self.screen.display[self.screen.cursor.y])
+        self.buffer_is("echo a")
+        self.send(b"\x1b[B")
+        self.until(lambda: "echo another-match [1/2]" in self.screen.display[self.screen.cursor.y])
+        self.buffer_is("echo a")
+
     def test_ghost_and_right_arrow(self) -> None:
         self.suggestion()
         self.send(b"\x1b[C")

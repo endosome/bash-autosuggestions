@@ -483,6 +483,8 @@ _bas_kill_line_handler() {
 # Suggestion cycling (Up / Down arrows)
 # ============================================================================
 _bas_cycle_next() {
+    # The arrow macro runs this callback, then a native readline action.
+    bind '"\e[99;3~": ""'
     if (( ${#_bas_candidates[@]} > 1 )); then
         # Multiple suggestions available - cycle through them
         _bas_cand_idx=$(( (_bas_cand_idx + 1) % ${#_bas_candidates[@]} ))
@@ -505,16 +507,13 @@ _bas_cycle_next() {
         # No suggestions - fall back to normal history navigation
         _bas_clear_ghost
         _bas_typed="$READLINE_LINE"
-        # Use readline's built-in previous-history function
-        bind '"\e[A": previous-history'
-        bind '"\eOA": previous-history'
-        # Trigger the history command by simulating the keypress
-        # (this won't work perfectly, but better than nothing)
-        # User can press Up again for history navigation
+        bind '"\e[99;3~": previous-history'
     fi
 }
 
 _bas_cycle_prev() {
+    # The arrow macro runs this callback, then a native readline action.
+    bind '"\e[99;3~": ""'
     if (( ${#_bas_candidates[@]} > 1 )); then
         # Multiple suggestions available - cycle through them
         _bas_cand_idx=$(( (_bas_cand_idx - 1 + ${#_bas_candidates[@]}) % ${#_bas_candidates[@]} ))
@@ -537,8 +536,7 @@ _bas_cycle_prev() {
         # No suggestions - fall back to normal history navigation
         _bas_clear_ghost
         _bas_typed="$READLINE_LINE"
-        bind '"\e[B": next-history'
-        bind '"\eOB": next-history'
+        bind '"\e[99;3~": next-history'
     fi
 }
 
@@ -693,11 +691,15 @@ _bas_setup() {
     bind -x '"\ef":     _bas_dispatch _bas_accept_word'
     bind -x '"\C-]":    _bas_dispatch _bas_dismiss'
 
-    # Suggestion cycling
-    bind -x '"\e[A": _bas_dispatch _bas_cycle_next'       # Up arrow
-    bind -x '"\eOA": _bas_dispatch _bas_cycle_next'       # Up arrow (alt seq)
-    bind -x '"\e[B": _bas_dispatch _bas_cycle_prev'       # Down arrow
-    bind -x '"\eOB": _bas_dispatch _bas_cycle_prev'       # Down arrow (alt seq)
+    # Run the callback and its chosen native action in the same keypress.
+    # Both cursor-key encodings occur in nested terminals.
+    bind -x '"\e[99;1~": _bas_dispatch _bas_cycle_next'
+    bind -x '"\e[99;2~": _bas_dispatch _bas_cycle_prev'
+    bind '"\e[99;3~": ""'
+    bind '"\e[A": "\e[99;1~\e[99;3~"'
+    bind '"\eOA": "\e[99;1~\e[99;3~"'
+    bind '"\e[B": "\e[99;2~\e[99;3~"'
+    bind '"\eOB": "\e[99;2~\e[99;3~"'
 
     # Editing keys
     bind -x '"\C-?": _bas_dispatch _bas_backspace_handler'
@@ -728,6 +730,8 @@ _bas_setup() {
         key=${binding#\"}
         _bas_bound_keys+=("${key%%\" *}")
     done < <(bind -X)
+    # Restore our macros and native-action slot as well as the callbacks.
+    _bas_bound_keys+=('\e[A' '\eOA' '\e[B' '\eOB' '\e[99;3~')
     _bas_bindings_active=1
 
     # Enter - DON'T bind Enter to avoid double-press issue
@@ -749,11 +753,6 @@ _bas_setup() {
         _bas_candidates=()
         _bas_cand_idx=-1
         # _bas_rebind_enter  # Not binding Enter anymore
-        # Rebind arrows in case they were temporarily rebound for history nav
-        bind -x '"\e[A": _bas_dispatch _bas_cycle_next'
-        bind -x '"\eOA": _bas_dispatch _bas_cycle_next'
-        bind -x '"\e[B": _bas_dispatch _bas_cycle_prev'
-        bind -x '"\eOB": _bas_dispatch _bas_cycle_prev'
         return "$command_status"
     }
 
